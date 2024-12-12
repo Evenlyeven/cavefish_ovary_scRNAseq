@@ -1,0 +1,2537 @@
+---
+title: "scRNA-Seq data analysis of cavefish ovary"
+author: "Analyst: Di Wu"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: yes
+    highlight: tango
+    number_sections: no
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+fontsize: 25pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, warning=TRUE, message=FALSE)
+```
+
+```{r}
+library(tidyverse) #tidy data
+library(dplyr) #tidy data 
+library(Seurat) #scRNAseq infrastructure
+library(zeallot) #assignment of pipe
+library(magrittr) #assignment of pipe
+library(ggplot2) #plots
+library(scales) #plots
+library(ggthemes) #plots
+library(patchwork) #plots
+
+#set up root paths
+root <- "./"
+##root path for intermediate data
+inter_data <- paste0(root, "data/interdata/analysis_v1/")
+# system(paste0("mkdir -p ", inter_data))
+##root path for deliverables
+del_root <- paste0(root, "results/deliverable/analysis_v1/")
+# system(paste0("mkdir -p ", del_root))
+##root path for plots
+plot_root <- paste0(root, "results/plots/analysis_v1/")
+# system(paste0("mkdir -p ", plot_root))
+
+rm(root)
+```
+
+# Sample information
+
+```{r eval=TRUE}
+sample_sheet <- readxl::read_xlsx(path = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/related_files/MOLNG-3814-experimental-variables-template.xlsx",
+                                  sheet = 1)
+sample_sheet$'2' <- NULL
+
+sample_sheet$`Sample ID` <- gsub(pattern = "S",
+                                 replacement = "L",
+                                 sample_sheet$`Sample ID`)
+
+sample_sheet_k <- sample_sheet[sample_sheet$`Sample ID` %in% c("L64220", "L64221", "L64997", "L64998", "L65101", "L65102"), ]
+
+knitr::kable(sample_sheet_k)
+```
+
+<br>
+
+# Quality control (QC)  
+
+## Ambient RNA correction with CellBender 0.3.0   
+
+According to [10X Genomics guide](https://www.10xgenomics.com/analysis-guides/introduction-to-ambient-rna-correction){target="blank"}, all samples need ambient RNA correction because all the knee plots lack characteristic steep cliff.   
+
+<br>
+
+```{r}
+#tutorial: https://cellbender.readthedocs.io/en/latest/usage/index.html
+
+#conda environment installed as cellbender
+
+#tested one sample, it worked
+#now we will submit a slurm job to run all samples in parallel 
+
+#generate a sample sheet (we only need a path, then cd, then run it there)
+paths <- dir(path = "/n/core/Bioinformatics/secondary/Rohner/fx2482/MOLNG-3814.Astyanax_mexicanus-2.0.Ens_110/",
+             pattern = "outs",
+             recursive = TRUE,
+             include.dirs = TRUE,
+             full.names = TRUE)
+paths %<>%
+  as.data.frame()
+
+write.table(paths,
+            sep = " ",
+            file = paste0("/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/sample_sheet_cellbender.txt"),
+            quote = FALSE,
+            row.names = FALSE, col.names = FALSE)
+```
+
+```{bash}
+#!/bin/bash
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --nodes=1 
+#SBATCH --ntasks=1 
+#SBATCH --mem=5GB
+#SBATCH --job-name=cellbender
+#SBATCH --array=1-6
+#SBATCH --output=array_job_%A_%a.out
+#SBATCH --error=array_job_%A_%a.err
+
+. ~/anaconda3/etc/profile.d/conda.sh
+
+conda activate cellbender
+
+paths=$(cat /n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/sample_sheet_cellbender.txt|\
+         awk -v var=$SLURM_ARRAY_TASK_ID 'NR==var {print $1}')
+
+cd ${paths}
+
+cellbender remove-background \
+      --cuda \
+      --input raw_feature_bc_matrix.h5 \
+      --output output.h5
+```
+
+```{bash}
+#!/bin/bash
+#SBATCH --nodes=1 
+#SBATCH --ntasks=1 
+#SBATCH --mem=5GB
+#SBATCH --job-name=cellbender
+#SBATCH --array=1-6
+#SBATCH --output=array_job_%A_%a.out
+#SBATCH --error=array_job_%A_%a.err
+
+. ~/anaconda3/etc/profile.d/conda.sh
+
+conda activate cellbender
+
+paths=$(cat /n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/sample_sheet_cellbender.txt|\
+         awk -v var=$SLURM_ARRAY_TASK_ID 'NR==var {print $1}')
+
+cd ${paths}
+
+ptrepack --complevel 5 output_filtered.h5:/matrix output_filtered_seurat.h5:/matrix
+```
+
+## Detection-based quality control (QC)  
+
+### QC visualization  
+
+#### Visualization of nFeature and nCount  
+
+```{r}
+## ===== Generate Seurat object ===== ##
+paths <- list.files(path = "/n/core/Bioinformatics/secondary/Rohner/fx2482/MOLNG-3814.Astyanax_mexicanus-2.0.Ens_110/",
+                    full.names = FALSE,
+                    recursive = TRUE,
+                    pattern = "output_filtered_seurat.h5")
+
+samples <- gsub(pattern = "\\/outs\\/output_filtered_seurat.h5",
+                replacement = "",
+                paths)
+
+ss <- cbind.data.frame("sample" = samples,
+                       "path" = paste0("/n/core/Bioinformatics/secondary/Rohner/fx2482/MOLNG-3814.Astyanax_mexicanus-2.0.Ens_110/", paths))
+
+#start here, replace lib names with sample names
+ds <- readxl::read_xlsx(path = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/related_files/MOLNG-3814-experimental-variables-template.xlsx",
+                      sheet = 1)
+colnames(ds)[1:2] <- c("lib_id", "sample_name")
+ds$lib_id <- gsub(pattern = "S",
+                  replacement = "L",
+                  ds$lib_id)
+ds_k <- ds[ds$lib_id %in% samples, ]#keep the samples that worked only
+ds_k$sample_name <- gsub(pattern = "New_",
+                         replacement = "",
+                         ds_k$sample_name)
+ds_k$sample_name <- gsub(pattern = "ovary_",
+                         replacement = "",
+                         ds_k$sample_name)
+
+rm(ds)
+
+ss_j <- left_join(x = ss,
+                  y = ds_k %>%
+                    select(lib_id, sample_name),
+                  by = join_by(sample == lib_id))
+colnames(ss_j)[1:2] <- c("Library_ID", "Paths")
+
+#read in seurat h5 files
+seu.list <- list()
+for (i in seq_along(ss_j$Library_ID)){
+  data.list <- Read10X_h5(filename = ss_j$Paths[i],
+                          use.names = TRUE)
+
+  seu.list[[i]] <- CreateSeuratObject(counts = data.list,
+                                      project = ss_j$sample_name[i])
+  seu.list[[i]]$sample_name <- ss_j$sample_name[i]
+  seu.list[[i]]$lib_ID <- ss_j$Library_ID[i]
+}
+names(seu.list) <- ss_j$sample_name
+
+#use nCount>500 as real cells like 10x did to keep real cells only
+seu.list <- lapply(X = seu.list,
+                   FUN = function(x){
+                     x <- subset(x, subset = nCount_RNA > 500)
+                   })
+
+rm(data.list, ds_k, ss, ss_j, i, paths, samples)
+
+save(seu.list, file = paste0(inter_data, "seuratobj.RData"))
+```
+
+```{r}
+#QC
+##we cannot calculate percentage of mitochondrial genes and ribosomal genes due to lack of annotation
+
+#plot QC
+##merge for visualization
+seu_m <- merge(seu.list[[1]], y = seu.list[2:length(seu.list)],
+               add.cell.ids = names(seu.list))
+
+#change the sequence of samples
+seu_m$sample_name <- factor(seu_m$sample_name,
+                            levels = unique(seu_m$sample_name))
+
+pv1 <- VlnPlot(seu_m,
+               features = c("nFeature_RNA"),
+               pt.size = 0,
+               cols = nord::nord_palettes$afternoon_prarie[3:9],
+               y.max = 10000,
+               ncol = 1,
+               group.by = "sample_name") +
+  NoLegend() +
+  xlab(label = "")
+pv2 <- VlnPlot(seu_m,
+               features = c("nCount_RNA"),
+               pt.size = 0,
+               cols = nord::nord_palettes$afternoon_prarie[3:9],
+               y.max = 125000,
+               ncol = 1,
+               group.by = "sample_name") +
+  NoLegend() +
+  xlab(label = "")
+
+png(filename = paste0(plot_root, "All_cells_qc.png"), width = 1500/2*.85, height = 500*2*.85)
+wrap_plots(pv1, pv2, ncol = 1)
+dev.off()
+
+rm(pv1, pv2)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/All_cells_qc.png)  
+<br>
+
+Keep in mind that Molino_2 has low nFeature_RNA and nCount_RNA.   
+
+<br>
+
+#### Visualization of feature and count coorelation  
+
+```{r}
+seu_obj <- seu.list
+
+plot_list <- list()
+for (i in seq_along(names(seu.list))){
+  plot_list[[i]] <-
+    FeatureScatter(seu_obj[[i]], feature1 = "nCount_RNA", feature2 = "nFeature_RNA")  + NoLegend() 
+  plot_list[[i]] <- plot_list[[i]] + labs(caption = names(seu.list)[i])
+}
+
+png(filename = paste0(plot_root, "All_cells_sca.png"), width = 300, height = 300*length(seu.list))
+wrap_plots(plot_list, ncol = 1)
+dev.off()
+
+rm(plot_list, i, seu_obj)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/All_cells_sca.png)  
+
+<br>
+
+### Detection-based filtering  
+
+Cells with unique RNA features of less than 200 or more than mean plus 3 fold of standard deviation were considered as low-quality cells and removed from the downstream analysis. Note that mitochondrial counts were not used for filtering due to lack of annotation.  
+
+```{r}
+##detection based filtering
+###calculate mean+3*standard deviation as the high cutoff value
+qc_list <- vector(mode = "integer",
+                  length = length(seu.list))
+for (i in seq_along(names(seu.list))){
+  qc_list[i] <- round(mean(seu.list[[i]]$nFeature_RNA) + 3 * sd(seu.list[[i]]$nFeature_RNA),
+                      digits = 0)
+}
+
+###filter genes according to detection
+seu_obj_sub <- list()
+for (i in seq_along(names(seu.list))){
+  seu_obj_sub[[i]] <- subset(seu.list[[i]],
+                              nFeature_RNA > 200 & nFeature_RNA < qc_list[i])
+}
+names(seu_obj_sub) <- names(seu.list)
+
+save(seu_obj_sub, file = paste0(inter_data, "All_cells_post_detection_based_filtering.RData"))
+rm(qc_list)
+
+#detection based QC stats table
+pre.qc <- vector("double", length(seu.list))
+post.qc <- vector("double", length(seu_obj_sub))
+for (i in seq_along(names(seu.list))){
+  pre.qc[i] <- ncol(seu.list[[i]])
+  post.qc[i] <- ncol(seu_obj_sub[[i]])
+}
+qc_df <- data.frame(pre.qc, post.qc)
+rownames(qc_df) <- names(seu.list)
+
+qc_df$excluded <- qc_df$pre.qc - qc_df$post.qc
+qc_df$excluded_pecentage <- paste0(round(qc_df$excluded / qc_df$pre.qc, digits = 4) * 100, "%")
+
+colnames(qc_df) <- c("Pre_QC", "Post_QC", "Low_quality_cells", "Low_quality_cell_pecentage")
+
+save(qc_df, file = paste0(inter_data, "for_plot_qc_stat.RData"))
+
+rm(qc_df, i, pre.qc, post.qc, seu_m)
+```
+
+#### Detection-based QC stats table    
+
+```{r eval=TRUE}
+load(file = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/interdata/analysis_v1/for_plot_qc_stat.RData")
+
+knitr::kable(qc_df,
+             align = "c")
+```
+
+<br>
+
+### Doublet-based QC  
+
+We will try a conserved doublet rate (half of the estimated doublet rate).
+
+```{r}
+#run on cerebro: 428631 25 min 10G
+
+library(dplyr) #tidy data and pipe assignment
+library(Seurat) #single cell infrastructure
+library(zeallot) #pipe assignment
+library(magrittr) #pipe assignment
+library(DoubletFinder) #find doublets
+
+#set up root paths
+root <- "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/"
+##root path for intermediate data
+inter_data <- paste0(root, "data/interdata/analysis_v1/")
+# system(paste0("mkdir -p ", inter_data))
+##root path for deliverables
+del_root <- paste0(root, "results/deliverable/analysis_v1/")
+# system(paste0("mkdir -p ", del_root))
+##root path for plots
+plot_root <- paste0(root, "results/plots/analysis_v1/")
+# system(paste0("mkdir -p ", plot_root))
+
+rm(root)
+
+load(file = paste0(inter_data, "All_cells_post_detection_based_filtering.RData"))
+
+###pre-process Seurat objects
+seu_obj_sub_dbpre <- list()
+for (i in seq_along(names(seu_obj_sub))){
+  seu_obj_sub_dbpre[[i]] <- seu_obj_sub[[i]] %>% 
+    SCTransform(vst.flavor = "v2",
+                variable.features.n = 3000) %>%
+    RunPCA() %>%
+    RunUMAP(dims = 1:30) %>%
+    FindNeighbors(dims = 1:30) %>%
+    FindClusters(resolution = 0.5)
+}
+save(seu_obj_sub_dbpre, file = paste0(inter_data, "TEMP_seu_obj_sub_dbpre.RData"))#delete later
+
+#load(file = paste0(inter_data, "TEMP_seu_obj_sub_dbpre.RData"))
+
+###pK Identification (no ground-truth)
+pK_ident <- function(x) {
+  paramSweep(x,
+             PCs = 1:30,
+             sct = TRUE) %>%
+    summarizeSweep(GT = FALSE) %>%
+    find.pK()
+}
+
+pK <- list()
+for (i in seq_along(names(seu_obj_sub))){
+  pK[[i]] <- pK_ident(seu_obj_sub_dbpre[[i]])
+}
+
+save(pK, file = paste0(inter_data, "TEMP_pK_ident_classic.RData"))#delete later
+
+###find the optimal pK
+#load(file = paste0(inter_data, "TEMP_pK_ident_classic.RData"))
+max_pK <- function(x){
+  arrange(x, desc(BCmetric)) %>%
+    summarise(max = dplyr::first(pK))
+}
+
+pK_i <- list()
+for (i in seq_along(names(seu_obj_sub))){
+  pK_i[[i]] <- max_pK(pK[[i]])
+}
+
+###doublets number estimation
+x <- c(500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000) 
+y <- c(.4, .8, 1.6, 2.3, 3.1, 3.9, 4.6, 5.4, 6.1, 6.9, 7.6)
+plot(x, y)
+equation <- lm(y ~ x)
+
+load(file = paste0(inter_data, "seuratobj.RData"))
+
+seu_obj <- seu.list
+
+####calculate how many doublets we expect in each sample
+cell_exp <- list()
+for (i in seq_along(names(seu_obj_sub))){
+  cell_exp[[i]] <- round(ncol(seu_obj_sub[[i]]) * ((predict(equation, data.frame(x = ncol(seu_obj[[i]])))/2/100)))
+}
+names(cell_exp) <- names(seu_obj_sub)
+
+save(pK_i, cell_exp, file = paste0(inter_data, "TEMP_for_3_dbf.RData"))#delete later
+
+###doublets finding
+###this step was run on cerebro using 3_dbf.R-----------------------------------
+for (i in seq_along(names(seu_obj_sub))){
+  seu_obj_sub_dbpre[[i]] <- doubletFinder(seu_obj_sub_dbpre[[i]],
+                                          PCs = 1:30, pN = 0.25,
+                                          pK = as.numeric(as.character(pK_i[[i]][[1]])),
+                                          nExp = cell_exp[[i]][[1]],
+                                          reuse.pANN = FALSE, sct = TRUE)
+}
+
+names(seu_obj_sub_dbpre) <- names(seu_obj_sub)
+
+save(seu_obj_sub_dbpre, file = paste0(inter_data, "CEREBRO_dbf2.RData"))
+```
+
+```{r}
+load(file = paste0(inter_data, "CEREBRO_dbf2.RData"))
+
+###change and rename the column to "DF.classifications" for visualization
+DF.class_in_meta <- list()
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  DF.class_in_meta[[i]] <- grep("DF.classifications",
+                                colnames(seu_obj_sub_dbpre[[i]]@meta.data),
+                                value = TRUE)
+}
+
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  seu_obj_sub_dbpre[[i]][["DF.classifications"]] <- seu_obj_sub_dbpre[[i]][[DF.class_in_meta[[i]]]]
+  seu_obj_sub_dbpre[[i]][[DF.class_in_meta[[i]]]] <- NULL
+}
+
+rm(DF.class_in_meta, i)
+
+pdf <- function(x){
+  pd <- DimPlot(x, reduction = "umap", group.by = "DF.classifications")
+  pc <- DimPlot(x, reduction = "umap", group.by = "seurat_clusters", label = TRUE, repel = TRUE) + 
+    #scale_colour_manual(values = p67) + 
+    labs(caption = as.character(x$sample_name)[1])
+  pd + pc
+}
+
+db_plots <- list()
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  db_plots[[i]] <- pdf(seu_obj_sub_dbpre[[i]])
+}
+
+png(filename = paste0(plot_root, "All_cells_db2_UMAP.png"), width = 1000, height = 500*6)
+wrap_plots(db_plots, ncol = 1)
+dev.off()
+
+rm(db_plots, pdf)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/All_cells_db2_UMAP.png)  
+<br>
+
+```{r}
+###doublets related visualization-Violin Plot
+###(we expect doublets contain more feature number than singlets)
+Vln.db <- function(x){
+  VlnPlot(
+    x,
+    features = c("nFeature_RNA"),
+    group.by = "DF.classifications"
+  ) +
+    labs(caption = as.character(x$sample_name)[1])
+}
+
+db_plots <- list()
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  db_plots[[i]] <- Vln.db(seu_obj_sub_dbpre[[i]])
+}
+
+png(filename = paste0(plot_root, "All_cells_db2_Vln.png"), width = 500, height = 500*6)
+wrap_plots(db_plots, ncol = 1)
+dev.off()
+
+rm(db_plots, Vln.db)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/All_cells_db2_Vln.png)  
+<br>
+
+```{r}
+###Remove doublets found by conserved doublet rate
+seu_obj_singlets <- list()
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  seu_obj_singlets[[i]] <- subset(seu_obj_sub_dbpre[[i]],
+                                  subset = DF.classifications == "Singlet")
+}
+names(seu_obj_singlets) <- names(seu_obj_sub_dbpre)
+
+save(seu_obj_singlets, file = paste0(inter_data, "All_cells_singlets.RData"))
+```
+
+```{r}
+###doublets stat table
+pre.db <- vector("double", length(names(seu_obj_sub_dbpre)))
+post.db <- vector("double", length(names(seu_obj_singlets)))
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  pre.db[i] <- ncol(seu_obj_sub_dbpre[[i]])
+  post.db[i] <- ncol(seu_obj_singlets[[i]])
+}
+db_df <- data.frame(pre.db, post.db)
+rownames(db_df) <- names(seu_obj_sub_dbpre)
+
+db_df$doublets <- db_df$pre.db - db_df$post.db
+db_df$doublets_percentage <- paste0(round(db_df$doublets / db_df$pre.db, digits = 4) * 100, "%")
+
+save(db_df, file = paste0(inter_data, "for_plot_db_stat.RData"))
+
+rm(i, pre.db, post.db, db_df, seu_obj_sub_dbpre)
+```
+
+#### Doublet-based QC stats table  
+
+```{r eval=TRUE}
+load(file = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/interdata/analysis_v1/for_plot_db_stat.RData")
+
+knitr::kable(db_df,
+             align = "c")
+```
+
+# Normalization and dimensional reduction  
+
+```{r}
+load(file = paste0(inter_data, "All_cells_singlets.RData"))
+
+#SCTransform
+seu_obj_singlets <- lapply(X = seu_obj_singlets,
+                           FUN = function(x){
+                             x <- SCTransform(x,
+                                              vst.flavor = "v2",
+                                              variable.features.n = 3000,
+                                              return.only.var.genes = FALSE)
+                           })
+
+save(seu_obj_singlets, file = paste0(inter_data, "All_cells_post_SCTransform.RData"))
+```
+
+We will merge fish group wise replicates, then integrate the three fish groups.  
+
+```{r}
+load(file = paste0(inter_data, "All_cells_post_SCTransform.RData"))
+
+## ===== sf ===== ##
+sf_m <- merge(seu_obj_singlets$Surface_fish_1, y = seu_obj_singlets$Surface_fish_2,
+              add.cell.ids = c("Surface_fish_1", "Surface_fish_2"))
+sf_m$fish <- "Surface_fish"
+sf_m %<>% PrepSCTFindMarkers(assay = "SCT")
+VariableFeatures(sf_m) <- c(VariableFeatures(seu_obj_singlets$Surface_fish_1),
+                            VariableFeatures(seu_obj_singlets$Surface_fish_2))
+
+## ===== pa ===== ##
+pa_m <- merge(seu_obj_singlets$Pachon_1, y = seu_obj_singlets$Pachon_2,
+              add.cell.ids = c("Pachon_1", "Pachon_2"))
+pa_m$fish <- "Pachon"
+pa_m %<>% PrepSCTFindMarkers(assay = "SCT")
+VariableFeatures(pa_m) <- c(VariableFeatures(seu_obj_singlets$Pachon_1),
+                            VariableFeatures(seu_obj_singlets$Pachon_2))
+
+## ===== mo ===== ##
+mo_m <- merge(seu_obj_singlets$Molino_1, y = seu_obj_singlets$Molino_2,
+              add.cell.ids = c("Molino_1", "Molino_2"))
+mo_m$fish <- "Molino"
+mo_m %<>% PrepSCTFindMarkers(assay = "SCT")
+VariableFeatures(mo_m) <- c(VariableFeatures(seu_obj_singlets$Molino_1),
+                            VariableFeatures(seu_obj_singlets$Molino_2))
+
+save(sf_m, pa_m, mo_m, file = paste0(inter_data, "All_fish_merged.RData"))
+
+rm(seu_obj_singlets)
+
+library(harmony)
+#integration using Harmony
+all_merge <- list(sf_m, pa_m, mo_m)
+names(all_merge) <- c("Surface_fish", "Pachon", "Molino")
+
+var_features <- SelectIntegrationFeatures(object.list = all_merge,
+                                          nfeatures = 3000)
+
+seu_m <- merge(all_merge[[1]], y = all_merge[2:length(all_merge)],
+               merge.data = TRUE)
+
+VariableFeatures(seu_m) <- var_features
+seu_m %<>%
+  RunPCA() %>%
+  RunHarmony(assay.use = "SCT",
+             group.by.vars = "fish")
+
+save(seu_m, file = paste0(inter_data, "all_fish_harmonied.RData"))
+
+#elbow plot
+p <- ElbowPlot(seu_m, ndims = 50) +
+  ggtitle(label = "Elbowplot of PCs")
+
+png(filename = paste0(plot_root, "all_fish_harmonied_PCA.png"), width = 800, height = 300)
+plot(p)
+dev.off()
+
+rm(p, var_features, all_merge, sf_m, pa_m, mo_m)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/all_fish_harmonied_PCA.png)  
+<br>
+
+## PC 40 resolution 0.5  
+
+Based on the elbow plot, we include the first PCs in the downstream analysis.  
+
+### UMAP and integration check  
+
+```{r}
+#pc40 res0.5
+set.seed(10086)
+
+i <- 40
+j <- 0.5
+
+seu_m.c <- seu_m %>%
+  FindNeighbors(dims = 1:i, reduction = "harmony") %>%
+  FindClusters(resolution = j) %>%
+  RunUMAP(dims = 1:i, reduction = "harmony")
+
+curio26 <- readRDS("~/color/curio26.rds")
+ph <- DimPlot(seu_m.c, label = TRUE, repel = TRUE, raster = FALSE, cols = curio26) +
+  NoLegend() +
+  coord_fixed()
+
+png(filename = paste0(plot_root, "all_fish_harmonied_PC40res0.5.png"), width = 800, height = 600)
+ph
+dev.off()
+
+rm(ph)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/all_fish_harmonied_PC40res0.5.png)  
+<br>
+
+```{r}
+ps <- DimPlot(seu_m.c, group.by = "fish") +
+  coord_fixed()
+
+png(filename = paste0(plot_root, "all_fish_harmonied_PC40res0.5_fish.png"), width = 800, height = 600)
+ps
+dev.off()
+
+rm(ps)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/all_fish_harmonied_PC40res0.5_fish.png)  
+<br>
+
+```{r}
+ps <- DimPlot(seu_m.c, split.by = "fish", group.by = "seurat_clusters", cols = curio26, label = TRUE, pt.size = .6) +
+  coord_fixed()
+
+png(filename = paste0(plot_root, "all_fish_harmonied_PC40res0.5_fish_cluster.png"), width = 600*3, height = 600)
+ps
+dev.off()
+
+rm(ps)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/all_fish_harmonied_PC40res0.5_fish_cluster.png)  
+<br>
+
+```{r}
+#sample wise UMAP
+p <-
+  DimPlot(
+    seu_m.c,
+    group.by = "seurat_clusters",
+    split.by = "sample_name",
+    cols = curio26,
+    label = TRUE,
+    pt.size = 1,
+    ncol = 2
+  ) +
+  coord_fixed()
+
+png(filename = paste0(plot_root, "all_fish_harmonied_PC40res0.5_sample_cluster.png"), width = 600*2, height = 600*2.6)
+p
+dev.off()
+
+rm(p)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/all_fish_harmonied_PC40res0.5_sample_cluster.png)  
+<br>
+
+### Exploration of known markers  
+
+```{r}
+seu_m.c %<>% PrepSCTFindMarkers(assay = "SCT")
+
+save(seu_m.c, file = paste0(inter_data, "all_fish_harmonied_post_SCTmarkers_PC40res.5.RData"))
+
+pf <- scCustomize::FeaturePlot_scCustom(seu_m.c,
+                                        features = c("ddx4",
+                                                     "gsdf",
+                                                     "cyp11a1.1",
+                                                     "col1a1a",
+                                                     "mpx",
+                                                     "MPEG1.1", 
+                                                     #"nkl.2", not found
+                                                     "fli1"),
+                                        num_columns = 4
+                                        ) &
+  coord_fixed() &
+  NoAxes()
+
+png(filename = paste0(plot_root, "all_fish_harmonied_PC40res.5_zf_markers.png"), width = 500*4*.8, height = 450*2*.8)
+pf
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/all_fish_harmonied_PC40res.5_zf_markers.png)  
+<br>
+
+# Integration with zebrafish data  
+
+To help with cell type annotation, we will integrate the data with public zebrafish data.  
+
+## Zebrafish paper seurat object download and processing    
+
+```{r}
+## ===== download their seurat obj (their descriptions are not very clear) ===== ##
+library(rvest)
+
+url_link <- "https://datadryad.org/stash/share/CEd0Zs4oZKdinTWeJPKbWYjBq6hYq4QhVacQcFjf37E"
+
+files_avail <- read_html(url_link) %>%
+  html_nodes("a") 
+
+to_download <- grep(pattern = "final",
+                    x = files_avail,
+                    value = TRUE)
+
+hrefs <- vector("character", length(to_download))
+titles <- vector("character", length(to_download))
+
+#extract hrefs and titles
+for (i in seq_along(to_download)) {
+  element <- read_html(to_download[i])
+
+  hrefs[i] <- html_attr(html_node(element, "a"), "href")
+  
+  titles[i] <- html_attr(html_node(element, "a"), "title")
+}
+
+save_path <- "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/pub_data/seu_obj/"
+system(paste0("mkdir -p ", save_path))
+
+for (i in seq_along(to_download)){
+ system(paste0("wget -O ", save_path, titles[i], " https://datadryad.org", hrefs[i])) 
+}
+```
+
+## Raw data (fastq) download and preprocessing    
+
+### Data information  
++ [Reference zebrafish paper](https://elifesciences.org/articles/76014){target="blank"}  
++ [Link to GSE191137](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE191137){target="blank"}  
+<br>
+
+### Download fastq files from GEO  
+
+```{r}
+#had issue installing GEOquery, we will just get the SRR IDs mannually since we only have three samples
+#40 day post-fertilization zebrafish ovaries cells, sorted germ cells: SRR17262952
+#40 day post-fertilization zebrafish ovaries cells (zx2): SRR17262951	
+#40 day post-fertilization zebrafish ovaries cells (zx4): SRR17262950	
+```
+
+```{bash}
+module load sratoolkit/3.0.1
+
+prefetch -X 200G SRR17262950
+fasterq-dump SRR17262950
+```
+
+### Cell Ranger Count  
+
+```{r}
+#need to rename files from SRRxxxxx_1.fastq to SRRxxxxx_S1_L001_R1_001.fastq
+
+#make a sample sheet for array jobs
+ss <- data.frame(sample = c("SRR17262950", "SRR17262951", "SRR17262952"))
+
+write.table(ss,
+            sep = " ",
+            file = paste0("/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/sample_sheet_cellranger.txt"),
+            quote = FALSE,
+            row.names = FALSE, col.names = FALSE)
+
+rm(ss)
+```
+
+```{bash}
+#!/bin/bash
+#SBATCH --time=168:00:00
+#SBATCH --mem=200G
+#SBATCH --job-name=cellranger_count
+#SBATCH --cpus-per-task=32
+#SBATCH --array=1-3
+#SBATCH --output=array_job_%A_%a.out
+#SBATCH --error=array_job_%A_%a.err
+
+sample=$(cat /n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/sample_sheet_cellranger.txt|\
+         awk -v var=$SLURM_ARRAY_TASK_ID 'NR==var {print $1}')
+
+module load cellranger/7.1.0
+
+cd /n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/pub_data/fastq/${sample}
+
+cellranger count --id=${sample} \
+                 --transcriptome=/n/analysis/genomes/Danio_rerio/GRCz11_primary_assembly/annotation/Ens_110/10x/cellranger-7.1.0 \
+                 --fastqs=/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/pub_data/fastq/${sample} \
+                 --sample=${sample} \
+                 --localcores=32 \
+                 --expect-cells=10000
+
+##first round no expect cells
+##3hrs 32 cores ~140G each
+##report _noexpcells
+
+##second round added expect cells according to the author GEO description
+##400144
+#only the first one succeeded, the other two failed
+#I remember yesterday, the first one also failed, maybe I will just try resubmitting the other two
+#400250_2 400250_3
+
+```
+
+Note that in the paper, the option <span style="background-color: #D3D3D3;">--expect-cells</span> was set to 10000, we will stick to that.    
+
+<br>
+
+## QC
+
+### Ambient RNA correction with CellBender 0.3.0    
+
+```{r}
+#create a sample sheet for array job with path to output
+ss <- data.frame(sample = c("SRR17262950", "SRR17262951", "SRR17262952"),
+                 path = c("/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/pub_data/fastq/SRR17262950/SRR17262950/outs",
+                          "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/pub_data/fastq/SRR17262951/SRR17262951/outs",
+                          "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/pub_data/fastq/SRR17262952/SRR17262952/outs"))
+
+write.table(ss,
+            sep = " ",
+            file = paste0("/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/sample_sheet_cellbender_pub.txt"),
+            quote = FALSE,
+            row.names = FALSE, col.names = FALSE)
+```
+
+```{bash}
+#!/bin/bash
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --nodes=1 
+#SBATCH --ntasks=1 
+#SBATCH --mem=100GB
+#SBATCH --job-name=cellbender
+#SBATCH --array=1-3
+#SBATCH --output=array_job_%A_%a.out
+#SBATCH --error=array_job_%A_%a.err
+
+. ~/anaconda3/etc/profile.d/conda.sh
+
+conda activate cellbender
+
+paths=$(cat /n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/sample_sheet_cellbender_pub.txt|\
+         awk -v var=$SLURM_ARRAY_TASK_ID 'NR==var {print $2}')
+
+cd ${paths}
+
+cellbender remove-background \
+      --cuda \
+      --input raw_feature_bc_matrix.h5 \
+      --output output.h5
+
+ptrepack --complevel 5 output_filtered.h5:/matrix output_filtered_seurat.h5:/matrix
+```
+
+<br>
+
+### Detection-based quality control (QC)    
+
+```{r}
+#read in post-cell bender data
+paths <- "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/pub_data/fastq/"
+h5_paths <- list.files(paths, pattern = "output_filtered_seurat.h5", full.names = TRUE, recursive = TRUE)
+
+names(h5_paths) <- c("zx4", "zx2", "sorted_germ_cells")
+
+seu.list <- list()
+for (i in seq_along(names(h5_paths))){
+  data.list <- Read10X_h5(filename = h5_paths[i],
+                          use.names = TRUE)
+
+  seu.list[[i]] <- CreateSeuratObject(counts = data.list,
+                                      project = names(h5_paths)[i])
+  seu.list[[i]]$sample_name <- names(h5_paths)
+}
+names(seu.list) <- names(h5_paths)
+
+#use nCount>500 as real cells like 10x did to keep real cells only
+seu.list <- lapply(X = seu.list,
+                   FUN = function(x){
+                     x <- subset(x, subset = nCount_RNA > 500)
+                   })
+
+rm(data.list, paths, h5_paths, i)
+
+save(seu.list, file = paste0(inter_data, "zf_seuratobj.RData"))
+```
+
+#### QC visualization  
+
+##### Visualization of nFeature, nCount, percentage of mitochondrial genes and ribosomal genes  
+
+```{r}
+#QC
+##calculate percentage of mitochondrial genes and ribosomal genes
+##Ribosomal genes also tend to be very highly represented, and can vary between cell types, so it can be instructive to see how prevalent they are in the data.
+##These are ribosomal protein genes rather than the actual rRNA, so they are more a measure of the translational activity of the cell rather than the cleanliness of the polyA selection.
+
+for (i in seq_along(names(seu.list))){
+  seu.list[[i]][["percent.mt"]] <-
+    PercentageFeatureSet(seu.list[[i]], pattern = "^mt-")
+  seu.list[[i]][["percent.ribo"]] <-
+    PercentageFeatureSet(seu.list[[i]], pattern = "^rp[l|s]")
+}
+
+#plot QC
+##merge for visualization
+seu_m <- merge(seu.list[[1]], y = seu.list[2:length(seu.list)],
+               add.cell.ids = names(seu.list))
+
+pv1 <- VlnPlot(seu_m,
+               features = c("nFeature_RNA"),
+               pt.size = 0,
+               cols = nord::nord_palettes$aurora,
+               ncol = 1) +
+  NoLegend() +
+  xlab(label = "")
+pv2 <- VlnPlot(seu_m,
+               features = c("nCount_RNA"),
+               pt.size = 0,
+               cols = nord::nord_palettes$aurora,
+               y.max = 150000,
+               ncol = 1) +
+  NoLegend() +
+  xlab(label = "")
+pv3 <- VlnPlot(seu_m,
+               features = c("percent.mt"),
+               pt.size = 0,
+               cols = nord::nord_palettes$aurora,
+               y.max = 100,
+               ncol = 1) +
+  NoLegend() +
+  xlab(label = "")
+pv4 <- VlnPlot(seu_m,
+               features = c("percent.ribo"),
+               pt.size = 0,
+               cols = nord::nord_palettes$aurora,
+               y.max = 100,
+               ncol = 1) +
+  NoLegend() +
+  xlab(label = "")
+
+png(filename = paste0(plot_root, "zf_qc.png"), width = 800, height = 800)
+wrap_plots(pv1, pv3, pv2, pv4, ncol = 2)
+dev.off()
+
+rm(pv1, pv2, pv3, pv4)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_qc.png)  
+<br>
+
+##### Visualization of feature and count coorelation  
+
+```{r}
+seu_obj <- seu.list
+
+plot_list <- list()
+for (i in seq_along(names(seu.list))){
+  plot_list[[i]] <-
+    FeatureScatter(seu_obj[[i]], feature1 = "nCount_RNA", feature2 = "percent.mt")  + NoLegend() +
+    FeatureScatter(seu_obj[[i]], feature1 = "nCount_RNA", feature2 = "nFeature_RNA")  + NoLegend() +
+    FeatureScatter(seu_obj[[i]], feature1 = "percent.ribo", feature2 = "percent.mt") + NoLegend()
+  plot_list[[i]] <- plot_list[[i]] + labs(caption = names(seu.list)[i])
+}
+
+png(filename = paste0(plot_root, "zf_sca.png"), width = 300*3, height = 300*length(seu.list))
+wrap_plots(plot_list, ncol = 1)
+dev.off()
+
+rm(plot_list, i, seu_obj)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_sca.png)  
+<br>
+
+#### Detection-based filtering  
+
+```{r}
+#from the paper:
+#For the sorted germ cell library, we retained cells with 200–6000 genes, less than 150,000 unique transcripts, and less than 5% mitochondrial transcripts. For whole ovary libraries, we retained the cells with 200–8000 genes, less than 200,000 unique transcripts, and less than 20% mitochondrial transcripts. These cutoffs were determined by the gene and transcript distributions of those libraries. Blood cells and a small number of germ cells were also removed from the whole ovary libraries. DoubletFinder was run using a conservative 5% estimated cell doublet cutoff 
+
+##detection based filtering
+###calculate mean+3*standard deviation as the high cutoff value
+qc_list <- vector(mode = "integer",
+                  length = length(seu.list))
+for (i in seq_along(names(seu.list))){
+  qc_list[i] <- round(mean(seu.list[[i]]$nFeature_RNA) + 3 * sd(seu.list[[i]]$nFeature_RNA),
+                      digits = 0)
+}
+
+# qc_list
+# [1] 6076 6176 9645
+
+#we will start with our own cutoffs but their mitochondiral cutoff
+mito_cutoff <- c(20, 20, 5)
+
+###filter genes according to both detection and mito percentage
+seu_obj_sub <- list()
+for (i in seq_along(names(seu.list))){
+  seu_obj_sub[[i]] <- subset(seu.list[[i]],
+                              nFeature_RNA > 300 & nFeature_RNA < qc_list[i] & percent.mt < mito_cutoff[i])
+}
+names(seu_obj_sub) <- names(seu.list)
+
+save(seu_obj_sub, file = paste0(inter_data, "zf_post_detection_based_filtering.RData"))
+rm(qc_list, mito_cutoff)
+
+#detection based QC stats table
+pre.qc <- vector("double", length(seu.list))
+post.qc <- vector("double", length(seu_obj_sub))
+for (i in seq_along(names(seu.list))){
+  pre.qc[i] <- ncol(seu.list[[i]])
+  post.qc[i] <- ncol(seu_obj_sub[[i]])
+}
+qc_df <- data.frame(pre.qc, post.qc)
+rownames(qc_df) <- names(seu.list)
+
+qc_df$excluded <- qc_df$pre.qc - qc_df$post.qc
+qc_df$excluded_pecentage <- paste0(round(qc_df$excluded / qc_df$pre.qc, digits = 4) * 100, "%")
+
+colnames(qc_df) <- c("Pre_QC", "Post_QC", "Low_quality_cells", "Low_quality_cell_pecentage")
+
+save(qc_df, file = paste0(inter_data, "for_plot_qc_stat_zf.RData"))
+
+rm(qc_df, i, pre.qc, post.qc, seu_m)
+```
+
+#### Detection-based QC stats table  
+
+```{r eval=TRUE}
+load(file = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/interdata/analysis_v1/for_plot_qc_stat_zf.RData")
+
+knitr::kable(qc_df,
+             align = "c")
+```
+
+### Doublet-based QC  
+
+We will use a conserved doublet rate as the paper did (the paper used 5%).  
+
+```{r}
+#run on cerebro: 409729  10 min 23G
+
+library(dplyr) #tidy data and pipe assignment
+library(Seurat) #single cell infrastructure
+library(zeallot) #pipe assignment
+library(magrittr) #pipe assignment
+library(DoubletFinder) #find doublets
+
+#set up root paths
+root <- "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/"
+##root path for intermediate data
+inter_data <- paste0(root, "data/interdata/analysis_v1/")
+# system(paste0("mkdir -p ", inter_data))
+##root path for deliverables
+del_root <- paste0(root, "results/deliverable/analysis_v1/")
+# system(paste0("mkdir -p ", del_root))
+##root path for plots
+plot_root <- paste0(root, "results/plots/analysis_v1/")
+# system(paste0("mkdir -p ", plot_root))
+
+rm(root)
+
+load(file = paste0(inter_data, "zf_post_detection_based_filtering.RData"))
+
+# ###pre-process Seurat objects
+# seu_obj_sub_dbpre <- list()
+# for (i in seq_along(names(seu_obj_sub))){
+#   seu_obj_sub_dbpre[[i]] <- seu_obj_sub[[i]] %>% 
+#     SCTransform(vst.flavor = "v2",
+#                 variable.features.n = 3000) %>%
+#     RunPCA() %>%
+#     RunUMAP(dims = 1:30) %>%
+#     FindNeighbors(dims = 1:30) %>%
+#     FindClusters(resolution = 0.5)
+# }
+# save(seu_obj_sub_dbpre, file = paste0(inter_data, "TEMP_seu_obj_sub_dbpre.RData"))#delete later
+
+load(file = paste0(inter_data, "TEMP_seu_obj_sub_dbpre.RData"))
+
+# ###pK Identification (no ground-truth)
+# pK_ident <- function(x) {
+#   paramSweep(x,
+#              PCs = 1:30,
+#              sct = TRUE) %>%
+#     summarizeSweep(GT = FALSE) %>%
+#     find.pK()
+# }
+# 
+# pK <- list()
+# for (i in seq_along(names(seu_obj_sub))){
+#   pK[[i]] <- pK_ident(seu_obj_sub_dbpre[[i]])
+# }
+# 
+# save(pK, file = paste0(inter_data, "TEMP_pK_ident_classic.RData"))#delete later
+
+###find the optimal pK
+load(file = paste0(inter_data, "TEMP_pK_ident_classic.RData"))
+max_pK <- function(x){
+  arrange(x, desc(BCmetric)) %>%
+    summarise(max = dplyr::first(pK))
+}
+
+pK_i <- list()
+for (i in seq_along(names(seu_obj_sub))){
+  pK_i[[i]] <- max_pK(pK[[i]])
+}
+
+# ###doublets number estimation
+# x <- c(500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000) 
+# y <- c(.4, .8, 1.6, 2.3, 3.1, 3.9, 4.6, 5.4, 6.1, 6.9, 7.6)
+# plot(x, y)
+# equation <- lm(y ~ x)
+# 
+# load(file = paste0(inter_data, "zf_seuratobj.RData"))
+# 
+# seu_obj <- seu.list
+
+####calculate how many doublets we expect in each sample
+cell_exp <- list()
+for (i in seq_along(names(seu_obj_sub))){
+  cell_exp[[i]] <- round(ncol(seu_obj_sub[[i]]) * 0.05)
+}
+names(cell_exp) <- names(seu_obj_sub)
+
+# save(pK_i, cell_exp, file = paste0(inter_data, "TEMP_for_3_dbf.RData"))#delete later
+
+###doublets finding
+###this step was run on cerebro using 3_dbf.R-----------------------------------
+for (i in seq_along(names(seu_obj_sub))){
+  seu_obj_sub_dbpre[[i]] <- doubletFinder(seu_obj_sub_dbpre[[i]],
+                                          PCs = 1:30, pN = 0.25,
+                                          pK = as.numeric(as.character(pK_i[[i]][[1]])),
+                                          nExp = cell_exp[[i]][[1]],
+                                          reuse.pANN = FALSE, sct = TRUE)
+}
+
+names(seu_obj_sub_dbpre) <- names(seu_obj_sub)
+
+save(seu_obj_sub_dbpre, file = paste0(inter_data, "CEREBRO_dbf_zf_0.05.RData"))
+```
+
+```{r}
+load(file = paste0(inter_data, "CEREBRO_dbf_zf_0.05.RData"))
+
+###change and rename the column to "DF.classifications" for visualization
+DF.class_in_meta <- list()
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  DF.class_in_meta[[i]] <- grep("DF.classifications",
+                                colnames(seu_obj_sub_dbpre[[i]]@meta.data),
+                                value = TRUE)
+}
+
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  seu_obj_sub_dbpre[[i]][["DF.classifications"]] <- seu_obj_sub_dbpre[[i]][[DF.class_in_meta[[i]]]]
+  seu_obj_sub_dbpre[[i]][[DF.class_in_meta[[i]]]] <- NULL
+}
+
+rm(DF.class_in_meta, i)
+
+pdf <- function(x){
+  pd <- DimPlot(x, reduction = "umap", group.by = "DF.classifications")
+  pc <- DimPlot(x, reduction = "umap", group.by = "seurat_clusters", label = TRUE, repel = TRUE) + 
+    #scale_colour_manual(values = p67) + 
+    labs(caption = as.character(x$sample_name)[1])
+  pd + pc
+}
+
+db_plots <- list()
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  db_plots[[i]] <- pdf(seu_obj_sub_dbpre[[i]])
+}
+
+png(filename = paste0(plot_root, "zf_db2_UMAP.png"), width = 1000, height = 500*3)
+wrap_plots(db_plots, ncol = 1)
+dev.off()
+
+rm(db_plots, pdf)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_db2_UMAP.png)   
+<br>
+
+```{r}
+###doublets related visualization-Violin Plot
+###(we expect doublets contain more feature number than singlets)
+Vln.db <- function(x){
+  VlnPlot(
+    x,
+    features = c("nFeature_RNA"),
+    group.by = "DF.classifications"
+  ) +
+    labs(caption = as.character(x$sample_name)[1])
+}
+
+db_plots <- list()
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  db_plots[[i]] <- Vln.db(seu_obj_sub_dbpre[[i]])
+}
+
+png(filename = paste0(plot_root, "zf_db2_Vln.png"), width = 500, height = 500*3)
+wrap_plots(db_plots, ncol = 1)
+dev.off()
+
+rm(db_plots, Vln.db)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_db2_Vln.png)  
+<br>
+
+```{r}
+###Remove doublets
+seu_obj_singlets <- list()
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  seu_obj_singlets[[i]] <- subset(seu_obj_sub_dbpre[[i]],
+                                  subset = DF.classifications == "Singlet")
+}
+names(seu_obj_singlets) <- names(seu_obj_sub_dbpre)
+
+save(seu_obj_singlets, file = paste0(inter_data, "zf_singlets.RData"))
+```
+
+#### Doublet-based QC stats table  
+
+```{r}
+###doublets stat table
+pre.db <- vector("double", length(names(seu_obj_sub_dbpre)))
+post.db <- vector("double", length(names(seu_obj_singlets)))
+for (i in seq_along(names(seu_obj_sub_dbpre))){
+  pre.db[i] <- ncol(seu_obj_sub_dbpre[[i]])
+  post.db[i] <- ncol(seu_obj_singlets[[i]])
+}
+db_df <- data.frame(pre.db, post.db)
+rownames(db_df) <- names(seu_obj_sub_dbpre)
+
+db_df$doublets <- db_df$pre.db - db_df$post.db
+db_df$doublets_percentage <- paste0(round(db_df$doublets / db_df$pre.db, digits = 4) * 100, "%")
+
+save(db_df, file = paste0(inter_data, "for_plot_db2_stat.RData"))
+
+rm(i, pre.db, post.db, db_df, seu_obj_sub_dbpre)
+```
+
+```{r eval=TRUE}
+load(file = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/interdata/analysis_v1/for_plot_db2_stat.RData")
+
+knitr::kable(db_df,
+             align = "c")
+```
+<br>
+
+## Merge, normalization and dimensional reduction  
+
+```{r}
+#didn't get similar UMAP, figured that the author merged the data and did not integrate
+
+load(file = paste0(inter_data, "zf_singlets.RData"))
+
+merged <- merge(seu_obj_singlets[[1]], y = seu_obj_singlets[2:length(seu_obj_singlets)],
+                add.cell.ids = names(seu_obj_singlets))
+
+# merged[["RNA"]] <- split(merged[["RNA"]],
+#                          f = merged$sample_name)
+
+merged %<>% SCTransform(vst.flavor = "v2",
+                           variable.features.n = 3000,
+                           return.only.var.genes = FALSE)
+
+
+#prep for DE analysis and visualization
+merged %<>% PrepSCTFindMarkers(assay = "SCT")
+
+#variable features
+VariableFeatures(merged) <- c(
+  VariableFeatures(seu_obj_singlets$sorted_germ_cells),
+  VariableFeatures(seu_obj_singlets$zx2),
+  VariableFeatures(seu_obj_singlets$zx4)
+)
+
+merged %<>% RunPCA()
+
+save(merged, file = paste0(inter_data, "zf_merged_sctpreped.RData"))
+
+load(file = paste0(inter_data, "zf_merged_sctpreped.RData"))
+
+#above was ran on cerebro interactive session
+
+##elbowplot
+p <- ElbowPlot(merged, ndims = 50) +
+  ggtitle("Elbow plot of PCs")
+
+png(filename = paste0(plot_root, "zf_merged_elbow.png"), width = 800, height = 300)
+p
+dev.off()
+
+rm(p)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_merged_elbow.png)  
+<br>
+
+22 PCs were included for the following analysis to be consistent with the paper.  
+
+```{r}
+set.seed(10086)
+
+i = 22
+j = .2
+
+merged.c <- merged %>%
+  FindNeighbors(dims = 1:i) %>%
+  FindClusters(resolution = j) %>%
+  RunUMAP(dims = 1:i)
+
+save(merged.c, file = paste0(inter_data, "zf_merged_PC22res0.2.RData"))
+
+#color35 <- readRDS("~/color/color35.rds")
+#color19_nord <- readRDS("~/color/color19_nord.rds")
+
+p <- DimPlot(merged.c,
+             #cols = color35,
+             label = TRUE,
+             repel = TRUE,
+             label.box = TRUE,
+             pt.size = .2) +
+  coord_fixed(ratio = 1)
+
+png(filename = paste0(plot_root, "zf_merged_PC20res0.2.png"), width = 800, height = 600)
+p
+dev.off()
+
+rm(p)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_merged_PC20res0.2.png)  
+<br>
+
+## Label transfer  
+
+This step transfers cell annotation labels from the seurat object the authors generated to our merged object.  
+
+```{r}
+#label transfer
+
+## ===== reference ===== ##
+load(file = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/pub_data/seu_obj/zx124_40com_final_orig.robj")
+#update seurat obj
+zx124_40com_final_orig <- UpdateSeuratObject(zx124_40com_final_orig)
+zx124_40com_final_orig$annotation <- zx124_40com_final_orig@active.ident
+
+zf_ref <- zx124_40com_final_orig
+rm(zx124_40com_final_orig)
+
+pref <- DimPlot(zf_ref, label.box = TRUE, label = TRUE) +
+  NoLegend() +
+  ggtitle("Cell type annotation from the author") +
+  coord_fixed()
+
+png(filename = paste0(plot_root, "zf_ref.png"), width = 800, height = 600)
+pref
+dev.off()
+
+rm(pref)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_ref.png)  
+<br>
+
+We may not need such a high resolution of cell types without actual meaning, we will combine the subclusters.  
+
+<br>
+
+```{r}
+zf_ref_meta <- zf_ref@meta.data
+zf_ref_meta$annotation_sm <- zf_ref_meta$annotation
+zf_ref_meta$annotation_sm <- gsub("Unknown_1|Unknown_2", "Unknown", zf_ref_meta$annotation_sm)
+zf_ref_meta$annotation_sm <- gsub("^Follicle.*", "Follicle", zf_ref_meta$annotation_sm)
+zf_ref_meta$annotation_sm <- gsub("^Stromal.*", "Stromal", zf_ref_meta$annotation_sm)
+zf_ref_meta$annotation_sm <- gsub("^Early.*|^Late.*|^Meio|^GSC.*", "Germ_cells", zf_ref_meta$annotation_sm)
+
+#double checked the number of cells looks right
+
+to_add <- zf_ref_meta$annotation_sm
+names(to_add) <- rownames(zf_ref_meta)
+
+zf_ref$annotation_sm <- to_add
+
+save(zf_ref, file = paste0(inter_data, "zf_ref.RData"))
+
+psm <- DimPlot(zf_ref, label.box = TRUE, label = TRUE, group.by = "annotation_sm") +
+  NoLegend() +
+  ggtitle("Cell type annotation in paper") +
+  coord_fixed()
+
+png(filename = paste0(plot_root, "zf_ref_sm.png"), width = 800, height = 600)
+psm
+dev.off()
+
+rm(psm)
+rm(to_add, zf_ref_meta)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_ref_sm.png)  
+<br>
+
+```{r}
+#query: merged.c
+#reference: zf_ref
+
+load(file = paste0(inter_data, "zf_ref.RData"))
+
+DefaultAssay(zf_ref) <- "RNA"
+zf_ref %<>% NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData()
+
+load(file = paste0(inter_data, "zf_merged_PC22res0.2.RData"))
+DefaultAssay(merged.c) <- "RNA"
+merged.c %<>% NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData()
+
+anchors <- FindTransferAnchors(reference = zf_ref,
+                               query = merged.c,
+                               reference.reduction = "pca",
+                               dims = 1:22)
+predictions <- TransferData(anchorset = anchors,
+                            refdata = zf_ref$annotation_sm,
+                            dims = 1:22)
+merged.c <- AddMetaData(merged.c, metadata = predictions)
+rm(anchors)
+
+save(merged.c, file = paste0(inter_data, "zf_merged_PC22res0.2.RData"))
+
+p <- DimPlot(merged.c,
+             label = TRUE,
+             repel = TRUE,
+             label.box = TRUE,
+             pt.size = .2,
+             group.by = "predicted.id") +
+  coord_fixed(ratio = 1)
+png(filename = paste0(plot_root, "zf_merged_PC22res0.2_pred.png"), width = 800, height = 600)
+p
+dev.off()
+
+rm(p)
+
+#FindTransferAnchors error: Normalizing query using reference SCT model
+# Warning: No layers found matching search pattern provided
+# Projecting cell embeddings
+# Error in h(simpleError(msg, call)) : 
+#   error in evaluating the argument 'x' in selecting a method for function 't': argument is of length zero
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_merged_PC22res0.2_pred.png)  
+<br>
+
+### Take a closer look at cluster 11  
+
+```{r}
+DefaultAssay(merged.c) <- "SCT"
+
+pf <- FeaturePlot(merged.c,
+                  features = c("prediction.score.Follicle", "prediction.score.Germ_cells")) &
+  coord_fixed()
+
+png(filename = paste0(plot_root, "zf_merged_PC22res0.2_pred_feat.png"), width = 800*1.6, height = 600)
+pf
+dev.off()
+
+rm(pf)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_merged_PC22res0.2_pred_feat.png)  
+<br>
+
+```{r}
+#marker exploration
+DefaultAssay(merged.c) <- "SCT"
+
+pf <- FeaturePlot(merged.c,
+                  features = c("gsdf", "ddx4")) &
+  coord_fixed()
+
+png(filename = paste0(plot_root, "zf_merged_PC22res0.2_pred_mar.png"), width = 800*1.6, height = 600)
+pf
+dev.off()
+
+rm(pf)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_merged_PC22res0.2_pred_mar.png)  
+<br>
+
+```{r}
+p1 <- DimPlot(zf_ref,
+              group.by = "orig.ident") +
+  coord_fixed()
+
+p2 <- DimPlot(merged.c,
+              group.by = "orig.ident") +
+  coord_fixed()
+
+png(filename = paste0(plot_root, "zf_ref_orig.png"), width = 800*2, height = 600)
+wrap_plots(list(p1, p2), ncol = 2)
+dev.off()
+
+rm(p1, p2)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_ref_orig.png)  
+<br>
+
+For ovary samples, the authors removed germ cells according to the ddx4 expression, and oocytes according to zp3 expression. We would expect to see germ cells here (potentially cluster 11 here).    
+
+<br>
+
+```{r}
+#zp3 expression
+
+p <- FeaturePlot(merged.c,
+                 features = c("zp3")) +
+  coord_fixed()
+
+png(filename = paste0(plot_root, "zf_merged_PC22res0.2_zp3.png"), width = 800, height = 600)
+p
+dev.off()
+
+rm(p)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_merged_PC22res0.2_zp3.png)  
+<br>
+
+Fanning pointed out zp3 expression makes sense, so we will keep cluster 11 in SAMap analysis.    
+<br>
+
+## Integration by using SAMap    
+
+```{bash}
+#!/bin/bash
+#SBATCH --time=168:00:00
+#SBATCH --mem=1300G
+#SBATCH --partition=bigmem
+#SBATCH --job-name=map_genes
+#SBATCH --cpus-per-task=98
+#SBATCH --error=job.%J.err
+#SBATCH --output=job.%J.out
+
+module load blast-plus/2.13.0
+
+/n/core/Bioinformatics/analysis/Yu/lim/cbio.lim.102/code/R_scripts_dw2733/SAMap_related/map_genes.sh --tr1 /n/analysis/genomes/Danio_rerio/GRCz11_primary_assembly/annotation/Ens_110/RSEM/GRCz11.Ens_110.RSEM.transcripts.fa --t1 nucl --n1 dr --tr2 /n/analysis/genomes/Astyanax_mexicanus/Astyanax_mexicanus-2.0/annotation/Ens_110/RSEM/Astyanax_mexicanus-2.0.Ens_110.RSEM.transcripts.fa --t2 nucl --n2 am --threads 98
+
+#402256: 4G 6hrs, did not need to use bigmem
+```
+
+```{r}
+## ===== add gene identity to tblastx results ===== ##
+#read in transcript file with transcript id to gene id
+dr <- read.delim(file = "/n/analysis/genomes/Danio_rerio/GRCz11_primary_assembly/annotation/Ens_110/tables/GRCz11.Ens_110.transcript_data.txt",
+                 sep = "\t")
+dr_keep <- dr %>%
+  select(Transcript_ID, Gene_ID)
+rm(dr)
+
+am <- read.delim(file = "/n/analysis/genomes/Astyanax_mexicanus/Astyanax_mexicanus-2.0/annotation/Ens_110/tables/Astyanax_mexicanus-2.0.Ens_110.transcript_data.txt",
+                 sep = "\t")
+am_keep <- am %>%
+  select(Transcript_ID, Gene_ID)
+rm(am)
+
+#read in tblastx results
+paths <- list.files(path = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/maps_orig/dram", full.names = TRUE)
+
+##am to dr
+am_to_dr <- read.table(file = paths[1], sep = "\t", header = FALSE)
+colnames(am_to_dr)[1:2] <- c("am_t", "dr_t")
+
+am_to_dr_mu <- am_to_dr %>%
+  mutate(am_g = am_keep$Gene_ID[match(am_t, am_keep$Transcript_ID)],
+         dr_g = dr_keep$Gene_ID[match(dr_t, dr_keep$Transcript_ID)])
+
+#after replacing the transcript IDs with gene IDs, does the bit score of the same pair change due to multi-mapping between transcripts and gene
+am_to_dr_to_save <- am_to_dr_mu %>%
+  select(am_g, dr_g, V3, V4,V5, V6, V6, V7, V8, V9, V10, V11, V12)
+
+##check if rows with duplicated am_g and dr_g have the same value in V12
+dup_res <- am_to_dr_to_save %>%
+  group_by(am_g, dr_g) %>%
+  summarize(n = n(),
+            same = n_distinct(V12) == 1) #%>%
+ # filter(n > 1, same == FALSE)
+
+##we do have duplicates, but SAMap handles that:
+# When a pair of genes share multiple High Scoring Pairs (HSPs), which are local regions of matching sequences, we use the HSP with the highest bit score to measure homology. Only pairs with E-value <10−6 are included in the graph.
+
+write.table(am_to_dr_to_save,
+            file = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/maps/dram/am_to_dr.txt",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE,
+            col.names = FALSE)
+
+##dr to am
+dr_to_am <- read.table(file = paths[2], sep = "\t", header = FALSE)
+colnames(dr_to_am)[1:2] <- c("dr_t", "am_t")
+
+dr_to_am_mu <- dr_to_am %>%
+  mutate(am_g = am_keep$Gene_ID[match(am_t, am_keep$Transcript_ID)],
+         dr_g = dr_keep$Gene_ID[match(dr_t, dr_keep$Transcript_ID)])
+
+#after replacing the transcript IDs with gene IDs, does the bit score of the same pair change due to multi-mapping between transcripts and gene
+dr_to_am_to_save <- dr_to_am_mu %>%
+  select(dr_g, am_g, V3, V4,V5, V6, V6, V7, V8, V9, V10, V11, V12)
+
+write.table(dr_to_am_to_save,
+            file = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/maps/dram/dr_to_am.txt",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE,
+            col.names = FALSE)
+
+
+## ===== reciprocal best hits ===== ##
+##am_to_dr_mu_to_save and dr_to_am_to_save will be the input for SAMap, we will filter the results with E-value (V11) < 0.001, bitscore (V12) > 100, length (V4) > 40, then define best hit as the gene pair with the highest bit score, then the mutual gene pairs are used to construct reciprocal best hits
+
+##am to dr
+#read in file
+am_to_dr_to_save <- read.table(file = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/maps/dram/am_to_dr.txt", sep = "\t", header = FALSE)
+#E-value, length, bitscore cutoff
+am_to_dr_k <- am_to_dr_to_save %>%
+  filter(V11 < 0.001 & V12 > 100 & V4 > 40)
+#keep the one with highest bit score
+am_to_dr_k_b <- am_to_dr_k %>%
+  group_by(V1) %>%
+  filter(V12 == max(V12))
+#keep distinct rows in terms of gene pairs * distinct
+am_to_dr_k_b_d <- am_to_dr_k_b %>%
+  distinct(V1, V2, .keep_all = TRUE)
+am_to_dr_k_b_d$to_match <- paste0(am_to_dr_k_b_d$V1, "_", am_to_dr_k_b_d$V2)
+rm(am_to_dr_to_save, am_to_dr_k, am_to_dr_k_b)
+
+##dr to am
+#read in file
+dr_to_am_to_save <- read.table(file = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/code/CEREBRO_related/maps/dram/dr_to_am.txt", sep = "\t", header = FALSE)
+#E-value cutoff
+dr_to_am_k <- dr_to_am_to_save %>%
+  filter(V11 < 0.001 & V12 > 100 & V4 > 40)
+#keep the one with highest bit score
+dr_to_am_k_b <- dr_to_am_k %>%
+  group_by(V1) %>%
+  filter(V12 == max(V12))
+#keep distinct rows in terms of gene pairs * distinct
+dr_to_am_k_b_d <- dr_to_am_k_b %>%
+  distinct(V1, V2, .keep_all = TRUE)
+dr_to_am_k_b_d$to_match <- paste0(dr_to_am_k_b_d$V2, "_", dr_to_am_k_b_d$V1)
+rm(dr_to_am_to_save, dr_to_am_k, dr_to_am_k_b)
+
+to_keep <- intersect(am_to_dr_k_b_d$to_match, dr_to_am_k_b_d$to_match)
+am_to_dr_to_keep <- am_to_dr_k_b_d %>%
+  filter(to_match %in% to_keep)
+dr_to_am_to_keep <- dr_to_am_k_b_d %>%
+  filter(to_match %in% to_keep)
+
+rm(am_to_dr_k_b_d, dr_to_am_k_b_d, to_keep)
+
+final_rbh <- am_to_dr_to_keep %>%
+  select(V1, V2)
+colnames(final_rbh) <- c("am_gene_ID", "dr_gene_ID")
+
+#add gene symbols
+dr_gene_data <- read.delim(file = "/n/analysis/genomes/Danio_rerio/GRCz11/annotation/Ens_110/tables/GRCz11.Ens_110.gene_data.txt",
+                           sep = "\t")
+##replace the row with empty gene symbol with gene ID in first column
+dr_gene_data$Name <- ifelse(dr_gene_data$Name == "", dr_gene_data$Gene_ID, dr_gene_data$Name)
+
+final_rbh_j <- left_join(x = final_rbh, 
+                         y = dr_gene_data %>%
+                           select(Gene_ID, Name), 
+                         by = c("dr_gene_ID" = "Gene_ID"))
+colnames(final_rbh_j)[3] <- "dr_gene_symbol"
+
+am_gene_data <- read.delim(file = "/n/analysis/genomes/Astyanax_mexicanus/Astyanax_mexicanus-2.0/annotation/Ens_110/tables/Astyanax_mexicanus-2.0.Ens_110.gene_data.txt",
+                           sep = "\t")
+##replace the row with empty gene symbol with gene ID in first column
+am_gene_data$Name <- ifelse(am_gene_data$Name == "", am_gene_data$Gene_ID, am_gene_data$Name)
+
+final_rbh_jj <- left_join(x = final_rbh_j,
+                          y = am_gene_data %>%
+                            select(Gene_ID, Name),
+                          by = c("am_gene_ID" = "Gene_ID"))
+colnames(final_rbh_jj)[4] <- "am_gene_symbol"
+
+final_rbh_to_save <- final_rbh_jj %>%
+  select(am_gene_ID, am_gene_symbol, dr_gene_ID, dr_gene_symbol)
+
+write.csv(final_rbh_to_save,
+          file = paste0(plot_root, "am_dr_rbh.csv"),
+          row.names = FALSE)
+
+am_gene_rbh <- nrow(final_rbh_to_save) / nrow(am_gene_data) * 100
+am_gene_rbh
+# [1] 60.93727
+# 16709 out of 27420
+
+dr_gene_rbh <- nrow(final_rbh_to_save) / nrow(dr_gene_data) * 100
+dr_gene_rbh
+# [1] 51.38069 16709 out of 32520
+
+
+#in house rbh pipeline script:
+#/n/core/bigDataAI/jr2396/CompBio/mcm/rbh_pipeline/scripts/rbh.R
+```
+
+```{r}
+## ===== save cavefish object as h5ad ===== ##
+
+##load integrated seu obj with some sort of annotations
+load(file = "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/data/interdata/analysis_v1/All_cells_integrated_PC30res0.4.RData")
+merged.c[["RNA"]] <- split(merged.c[["RNA"]], f = merged.c$sample_name)
+DefaultAssay(merged.c) <- "RNA"
+merged.c[["SCT"]] <- NULL
+
+##convert a v5 assay to a v3 assay
+merged.c[["RNA3"]] <- as(object = merged.c[["RNA"]], Class = "Assay")
+DefaultAssay(merged.c) <- "RNA3"
+merged.c[["RNA"]] <- NULL
+merged.c[["RNA"]] <- merged.c[["RNA3"]]
+DefaultAssay(merged.c) <- "RNA"
+merged.c[["RNA3"]] <- NULL
+
+##this is for my ocd
+merged.c$nFeature_SCT <- NULL
+merged.c$nCount_SCT <- NULL
+
+SeuratDisk::SaveH5Seurat(merged.c,
+             filename = paste0(inter_data, "am.h5Seurat"),
+             overwrite = TRUE)
+SeuratDisk::Convert(
+  paste0(inter_data, "am.h5Seurat"),
+  overwrite = TRUE,
+  paste0(inter_data, "am.h5ad")
+)
+```
+
+```{r}
+## ===== save cavefish object as h5ad ===== ##
+
+##load integrated seu obj with some sort of annotations
+load(file = paste0(inter_data, "all_fish_harmonied_post_SCTmarkers_PC40res.5.RData"))
+merged.c <- seu_m.c
+
+merged.c[["RNA"]] <- split(merged.c[["RNA"]], f = merged.c$sample_name)
+DefaultAssay(merged.c) <- "RNA"
+merged.c[["SCT"]] <- NULL
+
+##convert a v5 assay to a v3 assay
+merged.c[["RNA3"]] <- as(object = merged.c[["RNA"]], Class = "Assay")
+DefaultAssay(merged.c) <- "RNA3"
+merged.c[["RNA"]] <- NULL
+merged.c[["RNA"]] <- merged.c[["RNA3"]]
+DefaultAssay(merged.c) <- "RNA"
+merged.c[["RNA3"]] <- NULL
+
+##this is for my ocd
+merged.c$nFeature_SCT <- NULL
+merged.c$nCount_SCT <- NULL
+
+SeuratDisk::SaveH5Seurat(merged.c,
+             filename = paste0(inter_data, "am2.h5Seurat"),
+             overwrite = TRUE)
+SeuratDisk::Convert(
+  paste0(inter_data, "am2.h5Seurat"),
+  overwrite = TRUE,
+  paste0(inter_data, "am2.h5ad")
+)
+```
+
+Refer to SAMap.html    
+<br>
+
+### SAMap results  
+
+#### UMAP  
+
+```{r}
+#read in the h5ad file from SAMap: https://github.com/cellgeni/schard
+#sceasy and seuratdisk both didn't work
+seuobj <- schard::h5ad2seurat(paste0(inter_data, "samap_20240501.h5ad"))
+
+pd <- DimPlot(seuobj,
+              group.by = "species",
+              pt.size = .1,
+              cols = ggsci::pal_jco(alpha = .3)(2)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme(text = element_text(size = 18)) +
+  coord_fixed(ratio = 1.2)
+
+png(file = paste0(plot_root, "samap_20240501_umap.png"), width = 800, height = 600)
+pd
+dev.off()
+
+rm(pd)
+```
+
+<center>
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/samap_20240501_umap.png){width=50%}  
+</center>
+<br>
+
+##### Cavefish  
+
+```{r}
+#am cluster
+curio26 <- readRDS("~/color/curio26.rds")
+
+seuobj_am <- subset(seuobj, subset = species == "am")
+#this is for visualization purpose
+
+seuobj_am$am_seurat_clusters <- factor(seuobj_am$am_seurat_clusters, levels = c(paste0("Clu_", 0:25)))
+p <- DimPlot(seuobj_am,
+             group.by = "am_seurat_clusters",
+             pt.size = .6,
+             label = TRUE,
+             cols = c(curio26, "snow")) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme(text = element_text(size = 18)) +
+  coord_fixed(ratio = 1.2)
+
+png(file = paste0(plot_root, "samap_20240501_am_cluster.png"), width = 800, height = 600)
+p
+dev.off()
+
+rm(p)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/samap_20240501_am_cluster.png){width=45%}
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/all_fish_harmonied_PC40res0.5.png){width=45%}    
+
+<br>
+
+```{r}
+#split by fish
+p <- DimPlot(seuobj_am,
+             group.by = "am_seurat_clusters",
+             split.by = "am_fish",
+             pt.size = 1,
+             label = TRUE,
+             cols = curio26) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme(text = element_text(size = 18)) +
+  coord_fixed(ratio = 1.2)
+
+png(filename = paste0(plot_root, "samap_20240501_am_fish_cluster.png"), width = 800*2.5, height = 600)
+p
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/samap_20240501_am_fish_cluster.png)  
+<br>
+
+##### Zebrafish  
+
+```{r}
+seuobj_dr <- subset(seuobj, subset = species == "dr")
+#this is for visualization purpose
+
+p <- DimPlot(seuobj_dr,
+             group.by = "dr_predicted.id",
+             pt.size = .4,
+             label = TRUE,
+             repel = TRUE) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme(text = element_text(size = 18)) +
+  coord_fixed(ratio = 1)
+
+png(file = paste0(plot_root, "sdrap_20240501_dr_cluster.png"), width = 800, height = 600)
+p
+dev.off()
+
+rm(p)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/sdrap_20240501_dr_cluster.png){width=45%}
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/zf_merged_PC22res0.2_pred.png){width=45%}  
+<br>
+
+#### Alignment score visualization  
+
+```{r}
+#read in the alignment score
+mt <- read.csv(file = paste0(inter_data, "MappingTable_20240501.csv"))
+rownames(mt) <- mt$X
+mt_keep <- mt[mt$X %in% grep("^dr", mt$X, value = TRUE), colnames(mt) %in% grep("^am", mt$X, value = TRUE)]
+mt_keep <- mt_keep[ , paste0("am_Clu_", 0:25)]
+
+png(file = paste0(plot_root, "samap20240501_alignscore.png"), width = 500*2.7, height = 200*2.5, res = 100)
+corrplot::corrplot(as.matrix(mt_keep),
+                   method = "circle",
+                   col = corrplot::COL2("PiYG", 200),
+                   col.lim = c(0, 1),
+                   is.corr = FALSE,
+                   outline = TRUE,
+                   tl.col = "black",
+                   cl.ratio = .1,
+                   mar = c(3, 1, 1, 1))
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/samap20240501_alignscore.png)  
+<br>
+
+The alignment score is defined as the average number of mutual nearest cross-species neighbors of each cell relative to the maximum possible number of neighbors. It indicates similarity between cell types, the higher the alignment score, the more similar the cell types are.  
+
+<br>
+
+# Annotated UMAP  
+
+Processed seurat object can be downloaded from GEO [GSE282933](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?&acc=GSE282933){target="blank"}.  
+
+```{r}
+#load the seu obj from FN
+
+load(file = "/n/projects/fx2482/scRNA-seq-ovary/output/PC40_res0.5_replicatemerge_fishintegrate_harmony/Rdata/new_annotated_all_fish_harmonied_post_SCTmarkers_PC40res.5.RData")
+seu <- merged.integrate.40.c
+rm(merged.integrate.40.c)
+
+seu$annotation <- seu@active.ident
+
+#check the UMAP
+p <- DimPlot(seu,
+             group.by = "annotation",
+             pt.size = .4,
+             label = FALSE,
+             label.size = 5,
+             label.color = "black",
+             repel = TRUE,
+             cols = ggsci::pal_d3("category10")(10)) +
+  labs(x = "UMAP_1", y = "UMAP_2", title = "") +
+  theme(text = element_text(size = 18)) +
+  coord_fixed()
+
+png(file = paste0(plot_root, "all_fish_harmonied_PC40res0.5_ann.png"), width = 800, height = 600)
+p
+dev.off()
+
+rm(p)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/all_fish_harmonied_PC40res0.5_ann.png)  
+<br>
+
+# Follicular somatic cell subcluster analysis  
+
+To manage the effects of noise and potential bias introduced by other cell populations during trajectory inference, we will subset follicular somatic cell (previously annotated as ovarian follicle cells) and perform subcluster analysis.  
+
+Consistent with previous analysis, we will merge fish group wise replicates then integrate the three groups by using Harmony.  
+
+```{r}
+#load the seurat obj
+load(file = "/n/projects/fx2482/scRNA-seq-ovary/output/PC40_res0.5_replicatemerge_fishintegrate_harmony/Rdata/annotated_all_fish_harmonied_post_SCTmarkers_PC40res.5.RData")
+seu <- merged.integrate.40.c
+rm(merged.integrate.40.c)
+seu$annotation <- seu@active.ident
+
+#clean seu metadata
+to_rm <- grep(pattern = "sample_name|pANN|SCT|DF|seurat", x = colnames(seu@meta.data), value = TRUE)
+for (i in seq_along(to_rm)){
+  seu[[to_rm[i]]] <- NULL
+}
+
+DefaultAssay(seu) <- "RNA" 
+seu_sub <- subset(seu, subset = annotation %in% c("Ovarian follicle"))
+seu_sub_split <- SplitObject(seu_sub, split.by = "orig.ident")
+
+seu_sub_split <- lapply(X = seu_sub_split,
+                        FUN = function(x) {
+                          x <- SCTransform(
+                            x,
+                            vst.flavor = "v2",
+                            variable.features.n = 3000,
+                            return.only.var.genes = FALSE
+                          )
+                          return(x)
+                        })
+
+#we will merge fish group wise replicates then integrate the three groups
+## ===== sf ===== ##
+sf_m <- merge(seu_sub_split$Surface_fish_1, y = seu_sub_split$Surface_fish_2)
+sf_m %<>% PrepSCTFindMarkers(assay = "SCT")
+VariableFeatures(sf_m) <- c(VariableFeatures(seu_sub_split$Surface_fish_1),
+                            VariableFeatures(seu_sub_split$Surface_fish_2))
+
+## ===== pa ===== ##
+pa_m <- merge(seu_sub_split$Pachon_1, y = seu_sub_split$Pachon_2)
+pa_m %<>% PrepSCTFindMarkers(assay = "SCT")
+VariableFeatures(pa_m) <- c(VariableFeatures(seu_sub_split$Pachon_1),
+                            VariableFeatures(seu_sub_split$Pachon_2))
+
+## ===== mo ===== ##
+mo_m <- merge(seu_sub_split$Molino_1, y = seu_sub_split$Molino_2)
+mo_m %<>% PrepSCTFindMarkers(assay = "SCT")
+VariableFeatures(mo_m) <- c(VariableFeatures(seu_sub_split$Molino_1),
+                            VariableFeatures(seu_sub_split$Molino_2))
+
+save(sf_m, pa_m, mo_m, file = paste0(inter_data, "All_fish_ovarian_follicle_merged.RData"))
+
+library(harmony)
+#integration using Harmony
+all_merge <- list(sf_m, pa_m, mo_m)
+names(all_merge) <- c("Surface_fish", "Pachon", "Molino")
+
+var_features <- SelectIntegrationFeatures(object.list = all_merge, nfeatures = 3000)
+
+seu_m <- merge(all_merge[[1]],
+               y = all_merge[2:length(all_merge)],
+               merge.data = TRUE)
+
+VariableFeatures(seu_m) <- var_features
+seu_m %<>%
+  RunPCA() %>%
+  RunHarmony(assay.use = "SCT",
+             group.by.vars = "fish")
+
+save(seu_m, file = paste0(inter_data, "All_fish_ovarian_follicle_harmonied.RData"))
+
+#elbow plot
+p <- ElbowPlot(seu_m, ndims = 50) +
+  ggtitle(label = "Elbow plot of PCs")
+
+png(file = paste0(plot_root, "ovarian_follicle_elbow.png"), width = 800, height = 400)
+print(p)
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/ovarian_follicle_elbow.png)  
+<br>
+
+```{r}
+#explore PCs and res
+i_range <- c(20, 30, 40)
+j_range <- seq(from = 0.2, to = 0.8, by = 0.2)
+
+plots_list <- list()
+for (i in i_range){
+  for (j in j_range){
+    set.seed(10086)
+    
+    seu_m.c <- seu_m %>%
+      FindNeighbors(dims = 1:i, reduction = "harmony") %>%
+      FindClusters(resolution = j) %>%
+      RunUMAP(dims = 1:i, reduction = "harmony")
+    
+    plot_obj <- DimPlot(seu_m.c, reduction = "umap", raster = FALSE, label = TRUE, repel = TRUE) +
+      labs(caption = paste0("PC = ", as.character(i), " res = ", as.character(j)))
+    plots_list[[paste0("PC", i, "res", j)]] <- plot_obj
+  }
+}
+
+png(filename = paste0(plot_root, "all_fish_ovarian_follicle_harmonied_PCres.png"), width = 600*length(j_range), height = 500*length(i_range))
+wrap_plots(plots_list, ncol = length(j_range))
+dev.off()
+
+rm(plot_obj, plots_list, i, j, i_range, j_range)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/all_fish_ovarian_follicle_harmonied_PCres.png)  
+
+<br>
+
+According to elbow plot and UMAPs with different PC and res combinations, we will choose PC = 40, res = 0.8 for downstream analysis.  
+
+<br>
+
+## PC 40 res 0.8   
+
+```{r}
+load(file = paste0(inter_data, "All_fish_ovarian_follicle_harmonied.RData"))
+
+set.seed(10086)
+
+i <- 40
+j <- 0.8
+
+seu_m.c <- seu_m %>%
+  FindNeighbors(dims = 1:i, reduction = "harmony") %>%
+  FindClusters(resolution = j) %>%
+  RunUMAP(dims = 1:i, reduction = "harmony")
+
+save(seu_m.c, file = paste0(inter_data, "All_fish_ovarian_follicle_sub_PC40res0.8.RData"))
+
+color19_nord <- readRDS("~/color/color19_nord.rds")
+
+ph <- DimPlot(seu_m.c, label = TRUE, label.box = TRUE, repel = TRUE, raster = FALSE, cols = color19_nord, pt.size = .5) +
+  NoLegend() +
+  coord_fixed()
+
+png(filename = paste0(plot_root, "ovarian_follicle_PC40res0.8.png"), width = 800, height = 600)
+ph
+dev.off()
+
+rm(ph)
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/ovarian_follicle_PC40res0.8.png)  
+<br>
+
+```{r}
+load(file = paste0(inter_data, "All_fish_ovarian_follicle_sub_PC40res0.8.RData"))
+
+seu_m.c$fish <- factor(seu_m.c$fish, levels = c("Surface_fish", "Pachon", "Molino"))
+ph <- DimPlot(seu_m.c, label = TRUE, label.box = FALSE, repel = TRUE, raster = FALSE, cols = color19_nord, pt.size = 1.2, split.by = "fish") +
+  NoLegend() +
+  coord_fixed()
+png(filename = paste0(plot_root, "ovarian_follicle_PC40res0.8_fish.png"), width = 800*3, height = 600)
+print(ph)
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/ovarian_follicle_PC40res0.8_fish.png)  
+<br>
+
+```{r}
+#lhx9 is the marker of starting population cells
+pf <- scCustomize::FeaturePlot_scCustom(seu_m.c,
+                                        features = "lhx9",
+                                        pt.size = .5) +
+  coord_fixed()
+
+png(filename = paste0(plot_root, "ovarian_follicle_PC40res0.8_lhx9.png"), width = 800, height = 600)
+print(pf)
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/ovarian_follicle_PC40res0.8_lhx9.png)  
+<br>
+
+### Trajectory analysis  
+
+[Trajectory inference figure of zebrafish paper](https://iiif.elifesciences.org/lax/76014%2Felife-76014-fig2-figsupp1-v2.tif/full/,1500/0/default.jpg){target="blank"}  
+<br>
+
+```{r}
+library(monocle3)
+library(SeuratWrappers)
+
+#load seu obj
+load(file = paste0(inter_data, "All_fish_ovarian_follicle_sub_PC40res0.8.RData"))
+
+seu <- seu_m.c
+
+seu %<>% PrepSCTFindMarkers(assay = "SCT")
+
+cds <- seu %>%
+  as.cell_data_set(assay = "SCT",
+                   reduction = "umap") %>% #harmonied UMAP and SCT assay will be used for trajectory inference
+  cluster_cells(reduction_method = "UMAP",
+                cluster_method = "louvain") %>%
+  learn_graph(use_partition = FALSE)
+
+save(cds, file = paste0(inter_data, "All_fish_ovarian_follicle_sub_PC40res0.8_cds.RData"))
+
+#visualize Principle points
+plot_cells(cds, color_cells_by = "partition")
+
+p <- plot_cells(cds,
+           label_principal_points = TRUE,
+           color_cells_by = "cluster",
+           trajectory_graph_segment_size = 1,
+           cell_size = 0.65,
+           cell_stroke = 0.5,
+           graph_label_size = 3)
+
+png(file = paste0(plot_root, "monocle3_ovarian_follicle_sub_pick_root.png"), width = 800, height = 600)
+p
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/monocle3_ovarian_follicle_sub_pick_root.png)  
+<br>
+
+Y_88 will be set as the root cell for the trajectory inference.  
+
+```{r}
+cds %<>%
+  order_cells(reduction_method = "UMAP",
+              root_pr_nodes = "Y_88")
+
+save(cds, file = paste0(inter_data, "All_fish_ovarian_follicle_sub_PC40res0.8_cds_ordered.RData"))
+
+p <- plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups = FALSE,
+           label_leaves = FALSE,
+           label_roots = FALSE,
+           label_branch_points = FALSE,
+           show_trajectory_graph = TRUE,
+           trajectory_graph_segment_size = .75,
+           cell_size = 0.5,
+           cell_stroke = 0.5,
+           graph_label_size = 3) +
+  viridis::scale_color_viridis(option = "plasma",
+                               end = 1,
+                               direction = 1) +
+  coord_fixed() +
+  guides(color = guide_colorbar(title = "Pseudotime"))
+
+png(file = paste0(plot_root, "monocle3_ovarian_follicle_sub_pseudotime.png"), width = 1000, height = 600, res = 100)
+p
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/monocle3_ovarian_follicle_sub_pseudotime.png)  
+<br>
+
+```{r}
+#split by fish visualization
+p <- plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups = FALSE,
+           label_leaves = FALSE,
+           label_roots = FALSE,
+           label_branch_points = FALSE,
+           show_trajectory_graph = TRUE,
+           trajectory_graph_segment_size = .75,
+           cell_size = 0.5,
+           cell_stroke = 0.5,
+           graph_label_size = 3) +
+  viridis::scale_color_viridis(option = "plasma",
+                               end = 1,
+                               direction = 1) +
+  coord_fixed() +
+  guides(color = guide_colorbar(title = "Pseudotime")) +
+  facet_wrap(~fish, ncol = 1)
+
+png(file = paste0(plot_root, "monocle3_ovarian_follicle_sub_pseudotime_fish.png"), width = 1200, height = 600*3, res = 110)
+print(p)
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/monocle3_ovarian_follicle_sub_pseudotime_fish.png)  
+<br>
+
+```{r}
+#updated 2024 oct
+#fanning wants three separate figure for the three fish group
+load(file = paste0(inter_data, "All_fish_ovarian_follicle_sub_PC40res0.8_cds_ordered.RData"))
+
+#for title
+facet_titles <- c("Surface_fish" = "Surface fish", "Pachon" = "Pachón", "Molino" = "Molino")
+
+p <- plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups = FALSE,
+           label_leaves = FALSE,
+           label_roots = FALSE,
+           label_branch_points = FALSE,
+           show_trajectory_graph = TRUE,
+           trajectory_graph_segment_size = .9,
+           trajectory_graph_color = "black",
+           cell_size = 0.5,
+           cell_stroke = 0.5,
+           graph_label_size = 3) +
+  viridis::scale_color_viridis(option = "plasma",
+                               end = 1,
+                               direction = 1) +
+  coord_fixed() +
+  guides(color = guide_colorbar(title = "Pseudotime"))
+
+# Loop through each page and save as a separate image
+n_pages <- 3
+for (i in 1:n_pages) {
+  paginated_plot <- p +
+    ggforce::facet_wrap_paginate(
+      ~ fish,
+      nrow = 1,
+      ncol = 1,
+      page = i,
+      labeller = labeller(fish = facet_titles)
+    ) +
+    theme(strip.text = element_text(size = 17),
+          axis.title.x = element_text(size = 12),
+          axis.title.y = element_text(size = 12),
+          legend.title = element_text(size = 13))
+  
+  # Save each page
+  ggsave(paste0(plot_root, "facet_plot_page_", i, ".png"), paginated_plot, width = 8*.8, height = 4.5*.8)
+}
+```
+
+
+```{r}
+p <- plot_cells(cds,
+                color_cells_by = "pseudotime",
+                label_cell_groups = FALSE,
+                label_leaves = FALSE,
+                label_roots = TRUE,
+                label_branch_points = TRUE,
+                show_trajectory_graph = TRUE,
+                trajectory_graph_segment_size = .75,
+                cell_size = 0.5,
+                cell_stroke = 0.5,
+                graph_label_size = 3) +
+  viridis::scale_color_viridis(option = "plasma",
+                               end = 1,
+                               direction = 1) +
+  coord_fixed() +
+  guides(color = guide_colorbar(title = "Pseudotime"))
+
+png(file = paste0(plot_root, "monocle3_ovarian_follicle_sub_branch.png"), width = 1000, height = 600, res = 100)
+print(p)
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/monocle3_ovarian_follicle_sub_branch.png)  
+<br>
+
+```{r}
+p <- plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups = FALSE,
+           label_leaves = TRUE,
+           label_roots = TRUE,
+           label_branch_points = TRUE,
+           show_trajectory_graph = TRUE,
+           trajectory_graph_segment_size = .75,
+           cell_size = 0.5,
+           cell_stroke = 0.5,
+           graph_label_size = 3) +
+  viridis::scale_color_viridis(option = "plasma",
+                               end = 1,
+                               direction = 1) +
+  coord_fixed() +
+  guides(color = guide_colorbar(title = "Pseudotime"))
+
+png(file = paste0(plot_root, "monocle3_ovarian_follicle_sub_leaves.png"), width = 1000, height = 600, res = 100)
+print(p)
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/monocle3_ovarian_follicle_sub_leaves.png)  
+<br>
+
+> **Note**: The black lines show the structure of the graph. The circles with numbers in them denote special points within the graph. Each leaf, denoted by light gray circles, corresponds to a different outcome (i.e. cell fate) of the trajectory. Black circles indicate branch nodes, in which cells can travel to one of several outcomes. The white circle with number 1 in it indicates the root.     
+
+<br>
+
+```{r}
+#density plot
+
+#extract df from metadata so we get cell_id - fish
+df_p <- as.data.frame(colData(cds))
+df_p %<>% rownames_to_column(var = "cell_id")
+
+pseu_time <- pseudotime(cds)
+pseu_time_df <- data.frame(pseu_time)
+pseu_time_df %<>% rownames_to_column(var = "cell_id")
+
+df_p_j <- left_join(pseu_time_df, df_p, by = "cell_id")
+
+p <- ggplot(df_p_j, aes(x = pseu_time, fill = fish, color = fish)) +
+  geom_density() +
+  theme_minimal() +
+  ggsci::scale_fill_jco(alpha = .5) +
+  ggsci::scale_color_jco(alpha = .6) +
+  ggtitle("Density of pseudotime group by fish") +
+  xlab("Pseudotime") +
+  ylab("Density") +
+  theme(text = element_text(size = 18))
+
+png(file = paste0(plot_root, "monocle3_ovarian_follicle_sub_pseudotime_density.png"), width = 800, height = 400)
+print(p)
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/monocle3_ovarian_follicle_sub_pseudotime_density.png)  
+<br>
+
+```{r}
+#https://rpubs.com/mahima_bose/Seurat_and_Monocle3_p
+rowData(cds)$gene_name <- rownames(cds)
+rowData(cds)$gene_short_name <- rowData(cds)$gene_name
+
+cds$Pseudotime <- pseudotime(cds)
+
+plot_fun <- function(gene){
+  for_plot_cds <- cds[gene, ]
+  p <- monocle3::plot_genes_in_pseudotime(for_plot_cds,
+                                          color_cells_by = "pseudotime") +
+    theme(text = element_text(size = 20))
+  png(filename = paste0(plot_root, "monocle3_ovarian_follicle_sub_", gene, "_pseu.png"), width = 800, height = 400, res = 100)
+  print(p)
+  dev.off()
+}
+
+to_add <- c("wt1a", "gsdf", "fshr", "cyp11a1.1")#"lhcrg"
+for (i in seq_along(to_add)){
+  plot_fun(to_add[i])
+}
+
+for_plot_cds <- cds["lhx9", ]
+p <- monocle3::plot_genes_in_pseudotime(for_plot_cds,
+                                        color_cells_by = "pseudotime") +
+  theme(text = element_text(size = 20))
+
+png(filename = paste0(plot_root, "monocle3_ovarian_follicle_sub_lhx9_pseu.png"), width = 800, height = 400, res = 100)
+print(p)
+dev.off()
+```
+
+```{r eval=TRUE, results='asis'}
+to_add <- c("lhx9", "wt1a", "gsdf", "fshr", "cyp11a1.1", "lhcgr")
+plot_root <- "/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/"
+
+for (i in seq_along(to_add)){
+  cat(paste0("![](", plot_root, "monocle3_ovarian_follicle_sub_", to_add[i], "_pseu.png)\n\n"))
+}
+```
+
+<br>
+
+
+```{r}
+p <- plot_cells(
+  cds,
+  genes = "lhx9",
+  label_cell_groups = FALSE,
+  show_trajectory_graph = TRUE,
+  label_leaves = FALSE,
+  label_branch_points = FALSE,
+  label_roots = FALSE,
+  cell_size = 0.4,
+  cell_stroke = .6,
+  alpha = 0.8
+) +
+  coord_fixed() +
+  theme(text = element_text(size = 18),
+        legend.key.size = unit(.5, "cm"),
+        legend.text = element_text(size = 10), 
+        legend.title = element_text(size = 18))
+
+png(file = paste0(plot_root, "monocle3_ovarian_follicle_sub_lhx9.png"), width = 1000, height = 600, res = 100)
+print(p)
+dev.off()
+```
+
+![](/n/core/Bioinformatics/analysis/Rohner/fx2482/cbio.fx2482.100/results/plots/analysis_v1/monocle3_ovarian_follicle_sub_lhx9.png)  
+
+<br>
+
+# Session information  
+
+This report was knitted on `r Sys.Date()`.  
+
+```{r eval=TRUE}
+library(tidyverse) #tidy data
+library(dplyr) #tidy data 
+library(Seurat) #scRNAseq infrastructure
+library(zeallot) #assignment of pipe
+library(magrittr) #assignment of pipe
+library(ggplot2) #plots
+library(ggthemes) #plots
+library(scales) #plots
+library(patchwork) #plots
+library(harmony)
+library(monocle3)
+library(DoubletFinder)
+library(SeuratWrappers)
+
+devtools::session_info()
+```
+
+
+
